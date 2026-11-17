@@ -419,6 +419,67 @@ def _validate_slot_args(
     return True
 
 
+def _validate_checkpoint_cu_starts(
+    *,
+    cu_seqlens: torch.Tensor,
+    checkpoint_cu_starts: torch.Tensor,
+    checkpoint_every_n_tokens: int,
+    num_checkpoint_rows: int,
+    prefix_lens: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Debug-mode check that ``checkpoint_cu_starts`` is in checkpoint slots.
+
+    The kernels write sequence ``i``'s ``j``-th checkpoint to slot
+    ``checkpoint_cu_starts[i] + j`` without a bounds check, so token offsets
+    (e.g. ``cu_seqlens`` passed by mistake) silently write past
+    ``state_checkpoints``.  The values live on the device, so this costs a
+    device-to-host copy: it runs only with ``FLASHINFER_VALIDATE_INPUTS`` set
+    and is skipped during CUDA-graph capture.
+    """
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
+        return
+    if checkpoint_cu_starts.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    n = checkpoint_every_n_tokens
+    offsets = cu_seqlens.tolist()
+    starts = checkpoint_cu_starts.tolist()
+    prefixes = [0] * (len(offsets) - 1) if prefix_lens is None else prefix_lens.tolist()
+    counts = [
+        (p + end - begin) // n - p // n
+        for p, begin, end in zip(prefixes, offsets[:-1], offsets[1:], strict=True)
+    ]
+    unit_hint = (
+        "checkpoint_cu_starts holds checkpoint-slot offsets (cumulative "
+        "checkpoint counts per sequence), not token offsets like cu_seqlens"
+    )
+    if checkpoint_state_indices is None:
+        expected = [0]
+        for count in counts:
+            expected.append(expected[-1] + count)
+        if starts != expected:
+            raise ValueError(
+                f"{unit_hint}: expected {expected} for cu_seqlens={offsets} "
+                f"and checkpoint_every_n_tokens={n}, got {starts}"
+            )
+        if expected[-1] > num_checkpoint_rows:
+            raise ValueError(
+                f"state_checkpoints has {num_checkpoint_rows} rows but the "
+                f"batch stores {expected[-1]} checkpoints"
+            )
+        return
+    # With a checkpoint pool only each sequence's first entry is read, and it
+    # indexes checkpoint_state_indices rather than state_checkpoints.
+    num_entries = checkpoint_state_indices.numel()
+    for i, count in enumerate(counts):
+        if count and (starts[i] < 0 or starts[i] + count > num_entries):
+            raise ValueError(
+                f"{unit_hint}: sequence {i} stores {count} checkpoints from "
+                f"checkpoint_cu_starts[{i}]={starts[i]}, outside the "
+                f"{num_entries} entries of checkpoint_state_indices"
+            )
+
+
 def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
     names = {
         torch.float32: "float32",
@@ -1399,7 +1460,15 @@ def chunk_gated_delta_rule(
         ``checkpoint_every_n_tokens > 0``. Without ``checkpoint_state_indices``
         the values must be monotonic and consistent with ``cu_seqlens``; this
         caller precondition is not checked at launch to avoid a device-to-host
-        synchronization.
+        synchronization; set ``FLASHINFER_VALIDATE_INPUTS=1`` to check it
+        (outside CUDA-graph capture).
+
+        The values are offsets in checkpoint slots (rows of
+        ``state_checkpoints``), **not** token offsets: passing ``cu_seqlens``
+        here writes checkpoints out of bounds.  For example, two 256-token
+        sequences with ``checkpoint_every_n_tokens=64`` have
+        ``cu_seqlens = [0, 256, 512]`` and ``checkpoint_cu_starts = [0, 4, 8]``
+        (four checkpoints each, ``state_checkpoints.shape[0] == 8``).
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
@@ -1928,6 +1997,14 @@ def chunk_gated_delta_rule(
                     "state_checkpoints pool rows must be dense [H, V, K] blocks "
                     "with a row stride of at least H * V * K elements"
                 )
+        _validate_checkpoint_cu_starts(
+            cu_seqlens=cu_seqlens,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            num_checkpoint_rows=state_checkpoints.size(0),
+            prefix_lens=prefix_lens,
+            checkpoint_state_indices=checkpoint_state_indices,
+        )
 
     # Allocate output if not provided
     if output is None:
