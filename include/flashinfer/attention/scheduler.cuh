@@ -74,16 +74,20 @@ template <typename IdType>
 inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
     const uint32_t max_grid_size, const uint32_t gdy, const std::vector<IdType>& num_pages,
     const uint32_t min_num_pages_per_batch = 1) {
+  // An empty request (0 pages) still gets one work item (DecodeSplitKVIndptr and the final
+  // count below both use max(elem, 1)), so the search must count it the same way. Counting it
+  // as 0 lets the search pick a chunk size whose real work-item count exceeds max_grid_size /
+  // gdy, the number of slots DecodePlanImpl reserves under CUDA graphs.
   uint32_t low = min_num_pages_per_batch, high = 0;
   for (const IdType& elem : num_pages) {
-    high = max(high, elem);
+    high = max(high, std::max(elem, 1));
   }
   uint32_t new_batch_size;
   while (low < high) {
     uint32_t mid = (low + high) / 2;
     new_batch_size = 0;
     for (const IdType& elem : num_pages) {
-      new_batch_size += ceil_div(elem, mid);
+      new_batch_size += ceil_div(std::max(elem, 1), mid);
     }
     if (new_batch_size * gdy > max_grid_size) {
       low = mid + 1;
