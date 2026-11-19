@@ -4184,7 +4184,7 @@ def test_cub_transform_nonpositive_lengths(transform_mode, page_size, set_topk_a
 def test_cub_transform_workspace_paths(transform_mode, d, k):
     """No workspace falls back to internal allocation; a too-small one raises.
 
-    Deliberately binding-level: the dispatcher always passes the cached workspace, so
+    Deliberately binding-level: the dispatcher always supplies a workspace, so
     nothing else exercises the launcher's cudaMallocAsync fallback or its workspace-size
     ICHECK. Parametrized over all CUB entries, which share the workspace machinery.
     """

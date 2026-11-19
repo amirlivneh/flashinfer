@@ -29,7 +29,6 @@ from .trace.templates.sampling import (
     top_k_ragged_transform_trace,
 )
 from .utils import (
-    _get_cache_buf,
     _get_stream_cache_buf,
     check_shape_dtype_device,
     get_compute_capability,
@@ -1026,12 +1025,11 @@ def top_k(
 
     if use_cub:
         topk_module = get_topk_module()
-        # Host-side size query (launches nothing); the workspace is cached per device
-        # so repeated calls (including under CUDA graph capture) reuse a stable
-        # allocation.
+        # CUB writes this scratch. Give each invocation its own allocation so
+        # concurrent streams and independently captured graphs cannot alias it.
         workspace_bytes = topk_module.cub_topk_workspace_size(input, k, int(tie_break))
-        workspace_buffer: torch.Tensor = _get_cache_buf(
-            f"cub_topk_workspace_{device}", workspace_bytes, device
+        workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
         )
 
         output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
@@ -1283,9 +1281,6 @@ def top_k_page_table_transform(
 
     if use_cub:
         topk_module = get_topk_module()
-        # Host-side size query (launches nothing); the workspace is cached per device
-        # so repeated calls (including under CUDA graph capture) reuse a stable
-        # allocation.
         workspace_bytes = topk_module.cub_topk_page_table_transform_workspace_size(
             input,
             lengths,
@@ -1294,8 +1289,8 @@ def top_k_page_table_transform(
             out_raw_indices is not None,
             row_starts is not None,
         )
-        workspace_buffer: torch.Tensor = _get_cache_buf(
-            f"cub_topk_workspace_{device}", workspace_bytes, device
+        workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
         )
         if out is None:
             out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
@@ -1462,14 +1457,11 @@ def top_k_ragged_transform(
 
     if use_cub:
         topk_module = get_topk_module()
-        # Host-side size query (launches nothing); the workspace is cached per device
-        # so repeated calls (including under CUDA graph capture) reuse a stable
-        # allocation.
         workspace_bytes = topk_module.cub_topk_ragged_transform_workspace_size(
             input, lengths, k, int(tie_break), row_starts is not None
         )
-        workspace_buffer: torch.Tensor = _get_cache_buf(
-            f"cub_topk_workspace_{device}", workspace_bytes, device
+        workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
         )
         output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
         topk_module.cub_topk_ragged_transform(
