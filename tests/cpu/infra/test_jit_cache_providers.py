@@ -1328,6 +1328,72 @@ def test_jit_spec_dispatches_heterogeneous_aot_modules(monkeypatch, tmp_path):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("exact_loads", [True, False])
+def test_aot_load_recovers_with_a_compatible_provider(
+    monkeypatch, tmp_path, exact_loads
+):
+    name = "attention_module"
+    spec = jit_core.JitSpecNvcc(
+        name=name,
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    def install_provider(architecture):
+        root = tmp_path / architecture
+        artifact = root / name / spec.jit_library_path.name
+        artifact.parent.mkdir(parents=True)
+        artifact.touch()
+        return jit_env.AOTProvider(
+            provider_id=architecture,
+            distribution=f"flashinfer-jit-cache-{architecture}",
+            version="0.7.5+cu130",
+            jit_cache_dir=root,
+            cuda_architectures=frozenset({architecture}),
+            modules=frozenset({name}),
+        ), artifact
+
+    family, family_path = install_provider("sm120f")
+    exact, exact_path = install_provider("sm121a")
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", tmp_path / "bundled")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (family, exact))
+    monkeypatch.setattr(
+        jit_env, "_target_cuda_architectures", lambda: frozenset({"sm121a"})
+    )
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+
+    exact_module = SimpleNamespace(run=lambda: "exact provider")
+    family_module = SimpleNamespace(run=lambda: "family provider")
+    attempted = []
+
+    def load(path):
+        attempted.append(path)
+        if path == exact_path:
+            if exact_loads:
+                return exact_module
+            raise OSError("exact provider failed to load")
+        assert path == family_path
+        return family_module
+
+    monkeypatch.setattr(spec, "load", load)
+    assert spec.get_library_paths() == (exact_path,)
+    module = spec.build_and_load()
+    if exact_loads:
+        assert module is exact_module
+        assert attempted == [exact_path]
+        assert spec.get_library_paths() == (exact_path,)
+    else:
+        assert module is family_module
+        assert attempted == [exact_path, family_path]
+        assert spec.get_library_paths() == (family_path,)
+        assert spec.get_library_path() == family_path
+
+
+@pytest.mark.cpu_only
 def test_jit_spec_uses_partial_aot_provider_on_matching_device(monkeypatch, tmp_path):
     sm103_path = tmp_path / "sm103a.so"
     artifacts = (jit_env.AOTArtifact("sm103a", sm103_path, frozenset({"sm103a"})),)

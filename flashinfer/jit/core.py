@@ -496,6 +496,9 @@ class JitSpecNvcc(JitSpec):
     post_load_adapter: Optional[Callable[[Any], Any]] = None
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
     extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
+    _loaded_aot_paths: Optional[tuple[Path, ...]] = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def ninja_path(self) -> Path:
@@ -512,11 +515,13 @@ class JitSpecNvcc(JitSpec):
         )
 
     def get_library_path(self) -> Path:
-        if self.is_aot:
-            return self.aot_path
-        return self.jit_library_path
+        return self.get_library_paths()[0]
 
     def get_library_paths(self) -> tuple[Path, ...]:
+        # Callers registering native callbacks need the libraries that
+        # actually loaded, including any alternate provider chosen on retry.
+        if self._loaded_aot_paths is not None:
+            return self._loaded_aot_paths or (self.jit_library_path,)
         artifacts = self.aot_artifacts
         if artifacts:
             return tuple(artifact.path for artifact in artifacts)
@@ -583,35 +588,46 @@ class JitSpecNvcc(JitSpec):
         # so a cache miss here routes build_and_load() through build(),
         # where ninja no-ops if everything is up to date.
         artifacts = self.aot_artifacts
-        if artifacts:
-            loaded_modules = []
+        loaded_modules: dict[jit_env.AOTArtifact, Any] = {}
+        failed_paths: set[Path] = set()
+        while artifacts:
+            failures_before_round = len(failed_paths)
             for artifact in artifacts:
+                if artifact in loaded_modules or artifact.path in failed_paths:
+                    continue
                 try:
                     module = self.load(artifact.path)
                 except Exception as e:
+                    failed_paths.add(artifact.path)
                     logger.warning(
                         f"Failed to load AOT artifact {artifact.path}: {e}. "
                         "Trying another provider or falling back to JIT build."
                     )
                     continue
                 if artifact.cuda_architectures is None:
+                    self._loaded_aot_paths = (artifact.path,)
                     return module
-                loaded_modules.append((artifact, module))
+                loaded_modules[artifact] = module
 
-            if not loaded_modules:
-                return None
-            target_architectures = jit_env._target_cuda_architectures()
-            if len(loaded_modules) == 1:
-                provider_architectures = loaded_modules[0][0].cuda_architectures
-                assert provider_architectures is not None
-                if jit_env._provider_covers_targets(
-                    provider_architectures, target_architectures
-                ):
-                    return loaded_modules[0][1]
-            return _HeterogeneousAOTModule(
-                loaded_modules, self._build_and_load_jit_fallback
+            if len(failed_paths) == failures_before_round:
+                break
+            artifacts = jit_env.get_aot_artifacts(
+                self.name, excluded_paths=failed_paths
             )
-        return None
+
+        self._loaded_aot_paths = tuple(artifact.path for artifact in loaded_modules)
+        if not loaded_modules:
+            return None
+        if len(loaded_modules) == 1:
+            artifact, module = next(iter(loaded_modules.items()))
+            assert artifact.cuda_architectures is not None
+            if jit_env._provider_covers_targets(
+                artifact.cuda_architectures, jit_env._target_cuda_architectures()
+            ):
+                return module
+        return _HeterogeneousAOTModule(
+            tuple(loaded_modules.items()), self._build_and_load_jit_fallback
+        )
 
     def _build_and_load_jit_fallback(self) -> Any:
         with FileLock(self.lock_path, thread_local=False):

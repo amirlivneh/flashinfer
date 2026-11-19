@@ -28,7 +28,7 @@ import pathlib
 import platform
 import re
 from dataclasses import dataclass
-from typing import Any, FrozenSet, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, FrozenSet, Mapping, Optional, Tuple
 
 from ._cuda_architecture import (
     cuda_binary_target_compatibility_score,
@@ -348,10 +348,12 @@ def jit_library_name(module_name: str) -> str:
     return "module.dll" if platform.system() == "Windows" else f"{module_name}.so"
 
 
-def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
-    """Resolve the best installed AOT artifact for each visible CUDA target."""
+def get_aot_artifacts(
+    module_name: str, *, excluded_paths: AbstractSet[pathlib.Path] = frozenset()
+) -> Tuple[AOTArtifact, ...]:
+    """Resolve the best available AOT artifact for each visible CUDA target."""
     fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
-    if fallback_path.exists():
+    if fallback_path not in excluded_paths and fallback_path.exists():
         return (AOTArtifact("flashinfer-python", fallback_path, None),)
 
     target_architectures = _target_cuda_architectures()
@@ -372,7 +374,7 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
             provider_path = (
                 provider.jit_cache_dir / module_name / jit_library_name(module_name)
             )
-            if provider_path.exists():
+            if provider_path not in excluded_paths and provider_path.exists():
                 artifact = AOTArtifact(
                     provider.provider_id,
                     provider_path,
