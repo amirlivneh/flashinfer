@@ -30,6 +30,7 @@ from typing import (
 )
 
 import torch
+from filelock import FileLock
 
 from flashinfer.api_logging import cake_auto_candidates_enabled
 from flashinfer.autotune_cache import _ManagedCacheRecord
@@ -5213,7 +5214,8 @@ class AutoTuner:
         Note:
             This is called automatically on exit from
             ``with autotune(True, cache=path):``. Direct calls are only needed
-            for advanced use cases.
+            for advanced use cases. Writers coordinate through a
+            ``<path>.lock`` file next to the cache.
 
         Args:
             path: File path to write the JSON config to.
@@ -5229,11 +5231,21 @@ class AutoTuner:
                 model(inputs)
             AutoTuner.get().save_configs("/path/to/config.json")
         """
+        abs_path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        current_meta = _collect_metadata()
+        # Atomic replacement protects readers. Serializing the whole save
+        # also protects the generation check and merge from other writers.
+        with FileLock(f"{abs_path}.lock"):
+            self._save_configs_locked(abs_path, current_meta)
+
+    def _save_configs_locked(self, abs_path: str, current_meta: dict[str, str]) -> None:
         with self._lock:
             seq_at_snapshot = self._dirty_seq
             configs: dict[str, Any] = {}
             namespaced_records = copy.deepcopy(self._namespaced_records)
             dirty_namespaces = frozenset(self._dirty_namespaces)
+            observed_generation = self._observed_cache_generations.get(abs_path)
             invalidated_file_keys = frozenset(self._invalidated_file_keys)
 
             # Include previously loaded file configs as a base
@@ -5266,17 +5278,9 @@ class AutoTuner:
                     if selection is not None:
                         configs[file_key].append(selection)
 
-        current_meta = _collect_metadata()
-
-        # Re-read the file from disk and merge to reduce lost updates when
-        # multiple processes save to the same path.  Entries from this
-        # process take priority over on-disk entries.  The decision is made
-        # here, at save time, so that a file healed or replaced by another
-        # process since our load_configs() call is re-evaluated against its
-        # current on-disk metadata.
-        abs_path = os.path.abspath(path)
+        # Read the latest committed file under the writer lock. Re-evaluate
+        # its metadata since another process may have healed or replaced it.
         original_metadata = None
-        disk_generation: str | None = None
         try:
             with open(abs_path, "r") as f:
                 disk_configs = json.load(f)
@@ -5285,14 +5289,11 @@ class AutoTuner:
             disk_meta = disk_configs.pop(_METADATA_KEY, None)
             disk_generation = disk_configs.pop(_CACHE_GENERATION_KEY, None)
             disk_namespaced_records = disk_configs.pop(_NAMESPACED_RECORDS_KEY, {})
-            if dirty_namespaces:
-                with self._lock:
-                    observed = self._observed_cache_generations.get(abs_path)
-                if disk_generation != observed:
-                    raise RuntimeError(
-                        "Autotuner cache changed after it was loaded; namespaced "
-                        "records require one writer per cache path"
-                    )
+            if dirty_namespaces and disk_generation != observed_generation:
+                raise RuntimeError(
+                    "Autotuner cache changed after it was loaded; namespaced "
+                    "records require one writer per cache path"
+                )
             hard, soft = (
                 _classify_metadata_mismatches(disk_meta, current_meta)
                 if disk_meta is not None
@@ -5302,7 +5303,7 @@ class AutoTuner:
                 # Genuine environment conflict: leave the other
                 # environment's file untouched (mirrors load_configs).
                 message = (
-                    f"[Autotuner]: Not saving configs to {path}: the file "
+                    f"[Autotuner]: Not saving configs to {abs_path}: the file "
                     f"was created in a different environment "
                     f"({_format_meta_mismatches(hard)}). Use a different "
                     f"cache path for the current environment, or delete "
@@ -5324,7 +5325,14 @@ class AutoTuner:
                 configs = disk_configs
                 original_metadata = disk_meta
                 if isinstance(disk_namespaced_records, dict):
-                    disk_namespaced_records.update(namespaced_records)
+                    # An ordinary tactic save may have loaded an older copy
+                    # of these records. Only dirty namespaces can replace an
+                    # existing namespace in the latest committed file.
+                    for namespace, records in namespaced_records.items():
+                        if namespace in dirty_namespaces:
+                            disk_namespaced_records[namespace] = records
+                        else:
+                            disk_namespaced_records.setdefault(namespace, records)
                     namespaced_records = disk_namespaced_records
             # else: the on-disk entries were tuned in an environment the
             # writer could not identify ("unknown") — drop them and replace
@@ -5332,14 +5340,11 @@ class AutoTuner:
             # poisoned by e.g. cudnn_version="unknown", which would
             # otherwise be ignored by every future load_configs() forever.
         except FileNotFoundError:
-            if dirty_namespaces:
-                with self._lock:
-                    observed = self._observed_cache_generations.get(abs_path)
-                if observed is not None:
-                    raise RuntimeError(
-                        "Autotuner cache disappeared after it was loaded; namespaced "
-                        "records require one writer per cache path"
-                    ) from None
+            if dirty_namespaces and observed_generation is not None:
+                raise RuntimeError(
+                    "Autotuner cache disappeared after it was loaded; namespaced "
+                    "records require one writer per cache path"
+                ) from None
         except json.JSONDecodeError:
             if dirty_namespaces:
                 raise RuntimeError(
@@ -5356,8 +5361,6 @@ class AutoTuner:
         # The temp file is created in the same directory (dir=dir_name) so
         # that os.replace() is a same-filesystem rename, which is atomic.
         dir_name = os.path.dirname(abs_path)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             dir=dir_name, suffix=".tmp", prefix=".autotuner_"
         )
@@ -5392,7 +5395,7 @@ class AutoTuner:
             self._observed_cache_generations[abs_path] = new_generation
 
         logger.info(
-            f"[Autotuner]: Saved {len(configs)} configs to {path} "
+            f"[Autotuner]: Saved {len(configs)} configs to {abs_path} "
             f"({num_new} new, {num_previous} from previous config)"
         )
 

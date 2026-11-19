@@ -14,6 +14,9 @@ import os
 import sys
 import tempfile
 import types
+from concurrent.futures import ThreadPoolExecutor, wait
+from pathlib import Path
+from threading import Event
 
 import pytest
 import torch
@@ -638,10 +641,9 @@ class TestAutotuneCache:
     @pytest.mark.cpu_only
     def test_autotune_cache_saves_on_exit_when_tuning(self):
         """autotune(True, cache=path) should save configs on exit."""
-        tmp_dir = tempfile.mkdtemp()
-        tmp_path = os.path.join(tmp_dir, "cache.json")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "cache.json")
 
-        try:
             tuner = AutoTuner.get()
             runner = FakeRunnerA(value=1)
             _populate_cache(tuner, runner, "op1", ((1, 2),), tactic=5)
@@ -656,10 +658,6 @@ class TestAutotuneCache:
             assert len(configs) == 1
             entry = list(configs.values())[0]
             assert entry == ["FakeRunnerA", 5]
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
 
     @pytest.mark.cpu_only
     def test_autotune_cache_no_save_when_not_tuning(self):
@@ -692,10 +690,9 @@ class TestAutotuneCache:
     @pytest.mark.cpu_only
     def test_autotune_cache_nonexistent_file_creates_on_exit(self):
         """First run: cache file doesn't exist yet, should be created on exit."""
-        tmp_dir = tempfile.mkdtemp()
-        cache_path = os.path.join(tmp_dir, "new_cache.json")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_path = os.path.join(tmp_dir, "new_cache.json")
 
-        try:
             assert not os.path.exists(cache_path)
 
             tuner = AutoTuner.get()
@@ -710,10 +707,6 @@ class TestAutotuneCache:
             with open(cache_path, "r") as f:
                 data = json.load(f)
             assert len(_config_entries(data)) == 1
-        finally:
-            if os.path.exists(cache_path):
-                os.unlink(cache_path)
-            os.rmdir(tmp_dir)
 
     @pytest.mark.cpu_only
     def test_autotune_cache_no_cache_param(self):
@@ -730,10 +723,9 @@ class TestAutotuneCache:
     @pytest.mark.cpu_only
     def test_full_workflow_tune_then_inference(self):
         """End-to-end: autotune(True, cache=) then autotune(False, cache=)."""
-        tmp_dir = tempfile.mkdtemp()
-        tmp_path = os.path.join(tmp_dir, "cache.json")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "cache.json")
 
-        try:
             # Phase 1: Tune and save
             tuner = AutoTuner.get()
             runner = FakeRunnerA(value=42)
@@ -753,18 +745,13 @@ class TestAutotuneCache:
                 )
                 assert is_hit
                 assert tactic == 13
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
 
     @pytest.mark.cpu_only
     def test_incremental_cache_across_blocks(self):
         """Multiple autotune(True, cache=) blocks should accumulate configs."""
-        tmp_dir = tempfile.mkdtemp()
-        tmp_path = os.path.join(tmp_dir, "cache.json")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "cache.json")
 
-        try:
             runner_a = FakeRunnerA(value=1)
             runner_b = FakeRunnerB(value=2)
 
@@ -787,10 +774,6 @@ class TestAutotuneCache:
                 data = json.load(f)
             # Should have both op1 (from loaded file) and op2 (from profiling)
             assert len(_config_entries(data)) == 2
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            os.rmdir(tmp_dir)
 
     @pytest.mark.cpu_only
     def test_cache_hit_skips_profiling_during_tune(self):
@@ -840,7 +823,7 @@ class TestAtomicWrite:
 
     @pytest.mark.cpu_only
     def test_save_does_not_leave_partial_file_on_success(self):
-        """After a successful save, only the target file should exist (no temp files)."""
+        """After a successful save, no partial write should remain beside the cache."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             target = os.path.join(tmp_dir, "configs.json")
             tuner = AutoTuner.get()
@@ -857,7 +840,9 @@ class TestAtomicWrite:
 
             # No temp files should remain in the directory
             files = os.listdir(tmp_dir)
-            assert files == ["configs.json"], f"Unexpected files: {files}"
+            assert set(files) <= {"configs.json", "configs.json.lock"}, (
+                f"Unexpected files: {files}"
+            )
 
     @pytest.mark.cpu_only
     def test_save_creates_parent_directories(self):
@@ -1370,3 +1355,77 @@ class TestCudnnVersionDetection:
         monkeypatch.setitem(sys.modules, "cudnn", None)
         meta = autotuner_module._collect_metadata()
         assert meta["cudnn_version"] == "unknown"
+
+
+@pytest.mark.cpu_only
+def test_autotune_save_rejects_a_concurrent_stale_namespace_writer(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_TIMER", "cuda_event")
+    # Use fully determined, matching metadata so this is a same-environment save.
+    metadata = dict.fromkeys(autotuner_module._collect_metadata(), "test-environment")
+    monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: metadata.copy())
+
+    cache = tmp_path / "autotune.json"
+    AutoTuner().save_configs(str(cache))
+    first, second = AutoTuner(), AutoTuner()
+    assert first.load_configs(str(cache))
+    assert second.load_configs(str(cache))
+    first.publish_namespaced_records("first_writer", {"plan": [1]})
+    second.publish_namespaced_records("second_writer", {"plan": [2]})
+
+    first_at_rename = Event()
+    release_first = Event()
+    real_replace = autotuner_module.os.replace
+
+    def pause_first_replace(src, dst):
+        if Path(dst) == cache and not first_at_rename.is_set():
+            first_at_rename.set()
+            if not release_first.wait(timeout=10):
+                raise TimeoutError("first writer did not receive its release signal")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(autotuner_module.os, "replace", pause_first_replace)
+
+    with ThreadPoolExecutor(max_workers=2) as writers:
+        first_save = writers.submit(first.save_configs, str(cache))
+        try:
+            assert first_at_rename.wait(timeout=10)
+            second_save = writers.submit(second.save_configs, str(cache))
+            # On the current code the second commit finishes during the pause.
+            # A serialized autotuner_module may wait for the first commit.
+            wait([second_save], timeout=2)
+        finally:
+            release_first.set()
+        first_save.result(timeout=10)
+        second_error = second_save.exception(timeout=10)
+
+    records = json.loads(cache.read_text())["_records"]
+    assert isinstance(second_error, RuntimeError), (
+        f"second save returned {second_error!r}; final disk records: {records}"
+    )
+    assert "one writer per cache path" in str(second_error)
+    assert records == {"first_writer": {"plan": [1]}}
+
+
+@pytest.mark.cpu_only
+def test_ordinary_save_preserves_newer_namespaced_records(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_TIMER", "cuda_event")
+    metadata = dict.fromkeys(autotuner_module._collect_metadata(), "test-environment")
+    monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: metadata.copy())
+
+    cache = tmp_path / "autotune.json"
+    owner = AutoTuner()
+    owner.publish_namespaced_records("product", {"plan": [1]})
+    owner.save_configs(str(cache))
+    ordinary_writer = AutoTuner()
+    assert ordinary_writer.load_configs(str(cache))
+
+    owner.publish_namespaced_records("product", {"plan": [2]})
+    owner.save_configs(str(cache))
+    _populate_cache(ordinary_writer, FakeRunnerA(), "op", ((4,),), 1)
+    ordinary_writer.save_configs(str(cache))
+
+    saved = json.loads(cache.read_text())
+    assert saved["_records"] == {"product": {"plan": [2]}}
+    assert list(_config_entries(saved).values()) == [["FakeRunnerA", 1]]
