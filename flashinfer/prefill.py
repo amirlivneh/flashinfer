@@ -135,6 +135,24 @@ from .utils import (
 )
 
 
+def _fa2_plan_causal(
+    backend: str, causal: bool, has_custom_mask: bool, multi_item_scoring: bool
+) -> bool:
+    """The ``causal`` flag the FA2 planner needs: whether run() will apply a causal right edge.
+
+    The FA2 planner bounds each request's split-KV span by ``window_left + cta_tile_q``
+    when this is set. That is only correct when run() uses MaskMode.CAUSAL or
+    MULTIITEMSCORING: with a non-causal or custom mask a query tile needs every key from
+    its window start to ``kv_len``, so the planner must keep the full KV length. Other
+    backends get ``causal`` unchanged.
+    """
+    if backend != "fa2":
+        return causal
+    if multi_item_scoring:
+        return True
+    return causal and not has_custom_mask
+
+
 def _cudnn_identity_scales(q, k, v, q_scale, k_scale, v_scale):
     # Python unit scales carry no run-time state. Tensor scales may change after
     # capture, and FP8 must retain its explicit scale bindings even for 1.0.
@@ -4678,7 +4696,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
                 head_dim_vo,
-                causal,
+                _fa2_plan_causal(
+                    self._backend,
+                    causal,
+                    self._custom_mask_buf is not None or self._variant_owns_mask,
+                    self._prefix_len_ptr is not None,
+                ),  # window bounds the split-KV span only with a causal right edge
                 window_left,
             ]
             if self._backend == "fa2":
@@ -7304,7 +7327,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
                 head_dim_vo,
-                causal,
+                _fa2_plan_causal(
+                    self._backend,
+                    causal,
+                    self._custom_mask_buf is not None or self._variant_owns_mask,
+                    False,
+                ),  # window bounds the split-KV span only with a causal right edge
                 window_left,
             ]
             if self._backend == "fa2":

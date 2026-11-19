@@ -3446,7 +3446,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
-    const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
@@ -3816,8 +3815,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       finalize_m<KTraits>(variant, m);
 
+      // The partial-output row stride is the number of KV chunks the planner gave this
+      // request. Read it back from o_indptr (o_indptr[r+1] - o_indptr[r] = qo_len *
+      // num_chunks) rather than re-deriving it here, so the stride can never disagree
+      // with the plan (e.g. when the planner keeps the full KV span for a non-causal
+      // sliding window, where the window does not bound the tile's span).
       const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+          qo_len > 0 ? (o_indptr[request_idx + 1] - o_indptr[request_idx]) / qo_len : 1;
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
@@ -4372,7 +4376,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
-    const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
@@ -4889,8 +4892,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       finalize_m<KTraits>(variant, m);
 
+      // The partial-output row stride is the number of KV chunks the planner gave this
+      // request. Read it back from o_indptr (o_indptr[r+1] - o_indptr[r] = qo_len *
+      // num_chunks) rather than re-deriving it here, so the stride can never disagree
+      // with the plan (e.g. when the planner keeps the full KV span for a non-causal
+      // sliding window, where the window does not bound the tile's span).
       const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+          qo_len > 0 ? (o_indptr[request_idx + 1] - o_indptr[request_idx]) / qo_len : 1;
 
       if constexpr (KTraits::USE_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,

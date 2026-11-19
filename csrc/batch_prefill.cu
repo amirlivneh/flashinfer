@@ -41,6 +41,19 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
 using namespace flashinfer;
 
+namespace {
+// The planner shrinks each request's split-KV span to window_left + cta_tile_q. That bound
+// holds only when the mask also has a causal right edge: a query tile then needs at most
+// window_left + cta_tile_q keys. Without one (non-causal or custom mask), a tile needs every
+// key from its window start to kv_len, i.e. up to qo_len + window_left keys, so the planner
+// must keep the whole KV length or the chunks stop short and those keys are dropped.
+// `causal` here means "the kernel will run with a causal right edge" (kCausal or
+// kMultiItemScoring); callers that are unsure must pass false, which is always correct.
+inline int32_t PlanWindowLeft(bool causal, int64_t window_left) {
+  return causal ? static_cast<int32_t>(window_left) : -1;
+}
+}  // namespace
+
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
@@ -67,8 +80,9 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-      uniform_q_len, fixed_uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      /*sizeof_dtype_o=*/2, PlanWindowLeft(causal, window_left), fixed_split_size, disable_split_kv,
+      num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
+      /*kv_dtype_bytes=*/sizeof(DTypeKV));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
@@ -83,7 +97,6 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
     int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0, bool fixed_uniform_q_len = false) {
   (void)kv_len_arr;
-  (void)causal;
   size_t float_workspace_size_in_bytes = 0;
   size_t int_workspace_size_in_bytes = 0;
 
@@ -93,8 +106,9 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
       float_workspace_size_in_bytes, int_workspace_size_in_bytes,
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-      enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv,
-      num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
+      enable_cuda_graph, /*sizeof_dtype_o=*/2, PlanWindowLeft(causal, window_left),
+      fixed_split_size, disable_split_kv, num_colocated_ctas, uniform_q_len, fixed_uniform_q_len,
+      stream,
       /*kv_dtype_bytes=*/sizeof(DTypeKV));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
