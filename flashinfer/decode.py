@@ -64,6 +64,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    rollback_plan_on_error,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -1327,6 +1328,22 @@ def single_decode_with_kv_cache(
         return out
 
 
+def _decode_plan_regions(wrapper, args):
+    """Buffers BatchDecodeWithPagedKVCacheWrapper._plan_impl writes in place."""
+    batch_size = len(args["last_page_len"])
+    regions = [(getattr(wrapper, "_kv_lens_buffer", None), batch_size)]
+    if wrapper.is_cuda_graph_enabled:
+        regions += [
+            (wrapper._paged_kv_indptr_buf, None),
+            (wrapper._paged_kv_last_page_len_buf, None),
+            (wrapper._paged_kv_indices_buf, len(args["indices"])),
+            (getattr(wrapper, "_qo_indptr_buf", None), None),
+            (getattr(wrapper, "_xqa_mtp_block_tables", None), None),
+            (getattr(wrapper, "_cudnn_block_tables", None), None),
+        ]
+    return regions
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with a paged KV cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
@@ -2301,6 +2318,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             **plan_kwargs,
         )
 
+    @rollback_plan_on_error(_decode_plan_regions)
     def _plan_impl(
         self,
         indptr: torch.Tensor,

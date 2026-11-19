@@ -93,6 +93,7 @@ from .trace.templates.gemm import (
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .utils import (
+    rollback_plan_on_error,
     SINGLE_KERNEL_TMP_SIZE,
     FP4Tensor,
     MaskMode,
@@ -133,6 +134,46 @@ from .utils import (
     round_up,
     check_trtllm_gen_sm107_only_feature,
 )
+
+
+def _paged_prefill_plan_regions(wrapper, args):
+    """Buffers BatchPrefillWithPagedKVCacheWrapper.plan writes in place."""
+    batch_size = len(args["qo_indptr"]) - 1
+    regions = [(getattr(wrapper, "_kv_lens_buffer", None), batch_size)]
+    if wrapper.is_cuda_graph_enabled:
+        regions += [
+            (wrapper._qo_indptr_buf, None),
+            (wrapper._paged_kv_indptr_buf, None),
+            (wrapper._paged_kv_last_page_len_buf, None),
+            (wrapper._paged_kv_indices_buf, len(args["paged_kv_indices"])),
+        ]
+        if (
+            args.get("custom_mask") is not None
+            or args.get("packed_custom_mask") is not None
+        ):
+            regions += [
+                (wrapper._custom_mask_buf, None),
+                (wrapper._mask_indptr_buf, None),
+            ]
+    return regions
+
+
+def _ragged_prefill_plan_regions(wrapper, args):
+    """Buffers BatchPrefillWithRaggedKVCacheWrapper.plan writes in place."""
+    regions = []
+    if wrapper.is_cuda_graph_enabled:
+        regions += [(wrapper._qo_indptr_buf, None), (wrapper._kv_indptr_buf, None)]
+        if (
+            args.get("custom_mask") is not None
+            or args.get("packed_custom_mask") is not None
+        ):
+            regions += [
+                (wrapper._custom_mask_buf, None),
+                (wrapper._mask_indptr_buf, None),
+            ]
+        for buf in getattr(wrapper, "_cudnn_mask_buffers_flat", None) or ():
+            regions.append((buf, None))
+    return regions
 
 
 def _cudnn_identity_scales(q, k, v, q_scale, k_scale, v_scale):
@@ -3864,6 +3905,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
+    @rollback_plan_on_error(_paged_prefill_plan_regions)
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -6214,6 +6256,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         )
 
     @flashinfer_api
+    @rollback_plan_on_error(_ragged_prefill_plan_regions)
     def plan(
         self,
         qo_indptr: torch.Tensor,

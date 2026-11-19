@@ -371,6 +371,54 @@ def _ceil_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+PlanRegion = Tuple[Optional[torch.Tensor], Optional[int]]
+
+
+def rollback_plan_on_error(
+    regions: Callable[[object, Dict[str, object]], Iterable[PlanRegion]],
+) -> Callable:
+    """Make a wrapper's ``plan()`` all-or-nothing.
+
+    ``plan()`` writes the new batch into buffers that ``run()`` and captured CUDA
+    graphs read (the fixed CUDA-graph indptr/indices/last_page_len buffers are
+    written in place), and only afterwards finishes validating the request and
+    building the schedule. If it raised in between, the wrapper was left holding
+    the previous plan's schedule over the new batch's buffers, so a later
+    ``run()`` or graph replay attended over a batch that was never planned.
+
+    On any exception this restores every wrapper attribute and the contents of
+    the buffer regions ``regions(self, bound_args)`` names, then re-raises.
+    Each region is ``(tensor, n)``: the first ``n`` elements (``None``: all of
+    it). Regions are saved with stream-ordered device copies before ``plan()``
+    runs, so the cost is one small copy per buffer per plan.
+    """
+
+    def decorator(fn: Callable) -> Callable:
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            saved_attrs = dict(self.__dict__)
+            bound = signature.bind_partial(self, *args, **kwargs).arguments
+            saved_regions = []
+            for buf, n in regions(self, bound):
+                if torch.is_tensor(buf):
+                    view = buf if n is None else buf[:n]
+                    saved_regions.append((view, view.clone()))
+            try:
+                return fn(self, *args, **kwargs)
+            except BaseException:
+                for view, saved in saved_regions:
+                    view.copy_(saved)
+                self.__dict__.clear()
+                self.__dict__.update(saved_attrs)
+                raise
+
+        return wrapper
+
+    return decorator
+
+
 def _get_range_buf(seq_len: int, device: torch.device) -> torch.Tensor:
     seq_len_pow2 = _ceil_pow2(seq_len)
     key = (f"range_{seq_len_pow2}", device)
